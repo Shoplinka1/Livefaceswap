@@ -44,7 +44,7 @@ export function useFaceDetection() {
       setModelsLoaded(true);
     } catch (err: any) {
       console.warn('Model load error:', err);
-      setLoadError('AI models could not initialize. Try on a real phone browser.');
+      setLoadError('AI models could not initialize. Try Chrome or Safari on a real device.');
       setLoadingProgress(100);
       setModelsLoaded(true);
     }
@@ -57,7 +57,6 @@ export function useFaceDetection() {
     refLandmarksRef.current = null;
     setRefFaceStatus('detecting');
 
-    // Try progressively lower thresholds
     for (const threshold of [0.3, 0.2, 0.1, 0.05]) {
       try {
         const det = await faceapi
@@ -66,16 +65,14 @@ export function useFaceDetection() {
         if (det) {
           refLandmarksRef.current = det.landmarks;
           setRefFaceStatus('ready');
-          console.log('[FaceSwap] Reference face landmarks loaded ✓ (threshold:', threshold, ')');
           return;
         }
       } catch (e) {
         console.warn('[FaceSwap] Detection at threshold', threshold, 'failed:', e);
       }
     }
-    // No landmarks found — bounding-box fallback still works
     setRefFaceStatus('not_found');
-    console.warn('[FaceSwap] No face detected in reference — using bounding box fallback');
+    console.warn('[FaceSwap] No face in reference — bounding box fallback active');
   }, []);
 
   const startLoop = useCallback((
@@ -95,47 +92,47 @@ export function useFaceDetection() {
     };
 
     async function loop() {
-      // Always draw the mirrored video frame first — this keeps the screen alive
-      if (videoEl && videoEl.readyState >= 2) {
-        const W = videoEl.videoWidth || 640;
-        const H = videoEl.videoHeight || 480;
+      const W = videoEl.videoWidth || 640;
+      const H = videoEl.videoHeight || 480;
 
-        if (outputCanvas.width !== W) outputCanvas.width = W;
-        if (outputCanvas.height !== H) outputCanvas.height = H;
+      // Resize canvas only when needed (resizing clears the canvas)
+      if (outputCanvas.width !== W) outputCanvas.width = W;
+      if (outputCanvas.height !== H) outputCanvas.height = H;
 
-        // Draw mirrored camera feed
+      // Always draw the mirrored camera frame — even if readyState is low,
+      // drawImage on a video that has no data is a no-op, not an error.
+      // This ensures the canvas is NEVER fully black due to our code.
+      try {
         ctx.save();
         ctx.scale(-1, 1);
         ctx.drawImage(videoEl, -W, 0, W, H);
         ctx.restore();
+      } catch {
+        // drawImage failed — skip this frame but keep looping
+        rafRef.current = requestAnimationFrame(loop);
+        return;
+      }
 
-        // Face swap overlay
-        if (refImageRef.current) {
-          try {
-            const det = await faceapi
-              .detectSingleFace(
-                outputCanvas,
-                new faceapi.TinyFaceDetectorOptions({ scoreThreshold: 0.2, inputSize: 224 })
-              )
-              .withFaceLandmarks(true);
+      // Only attempt face detection when the video is actually delivering frames
+      if (videoEl.readyState >= 2 && videoEl.videoWidth > 0 && refImageRef.current) {
+        try {
+          const det = await faceapi
+            .detectSingleFace(
+              outputCanvas,
+              new faceapi.TinyFaceDetectorOptions({ scoreThreshold: 0.2, inputSize: 224 })
+            )
+            .withFaceLandmarks(true);
 
-            updateFD(!!det);
+          updateFD(!!det);
 
-            if (det) {
-              swapFace(
-                ctx,
-                det,
-                refImageRef.current,
-                refLandmarksRef.current,
-                intensityRef.current
-              );
-            }
-          } catch {
-            updateFD(false);
+          if (det) {
+            swapFace(ctx, det, refImageRef.current, refLandmarksRef.current, intensityRef.current);
           }
-        } else {
+        } catch {
           updateFD(false);
         }
+      } else if (!refImageRef.current) {
+        updateFD(false);
       }
 
       rafRef.current = requestAnimationFrame(loop);
@@ -163,17 +160,16 @@ export function useFaceDetection() {
 
 // ─── Core face-swap renderer ────────────────────────────────────────────────
 //
-// The live canvas is MIRRORED (scale(-1,1) applied when drawing video).
-// All live landmark coordinates are in mirrored canvas space.
+// MIRRORING CONTRACT:
+//   The canvas always shows a MIRRORED camera feed (left/right flipped).
+//   Live landmarks are therefore in mirrored canvas space.
+//   The reference image is a normal (non-mirrored) photo.
 //
-// The reference image is a normal (non-mirrored) photo.
-// We must draw it mirrored to match the canvas orientation, and adjust the
-// similarity transform accordingly (eye-line direction flips on x-axis).
-//
-// Two modes:
-//   • Landmark mode — ref image had a detectable face → align eye centers with
-//                     correct mirrored similarity transform
-//   • Fallback mode — no ref landmarks → bounding-box stretch, mirrored
+//   Fix: draw the ref image mirrored horizontally so it matches the canvas
+//   orientation, and adjust the similarity transform accordingly:
+//     • Eye-line direction of mirrored ref = (-refDx, refDy)
+//     • Rotation = atan2(liveDy, liveDx) − atan2(refDy, −refDx)
+//     • Anchor point = mirrored ref eye center = (W_ref − refCx, refCy)
 
 function swapFace(
   ctx: CanvasRenderingContext2D,
@@ -186,40 +182,23 @@ function swapFace(
   const bb = liveDet.detection.box;
   const W_ref = refImg.naturalWidth;
   const H_ref = refImg.naturalHeight;
+  if (W_ref < 1 || H_ref < 1) return;
 
   ctx.save();
 
-  // ── Face oval clip ─────────────────────────────────────────────────────────
+  // Clip to a face-shaped oval
   ctx.beginPath();
   ctx.ellipse(
-    bb.x + bb.width / 2,
+    bb.x + bb.width  / 2,
     bb.y + bb.height / 2,
-    (bb.width  / 2) * 1.1,
+    (bb.width  / 2) * 1.10,
     (bb.height / 2) * 1.15,
     0, 0, Math.PI * 2
   );
   ctx.clip();
   ctx.globalAlpha = intensity;
 
-  if (refLandmarks && W_ref > 0 && H_ref > 0) {
-    // ── LANDMARK MODE ─────────────────────────────────────────────────────────
-    //
-    // Live eye landmarks are in MIRRORED canvas space:
-    //   liveLE (eye indices 36-41) → appears on RIGHT side of screen
-    //   liveRE (eye indices 42-47) → appears on LEFT side of screen
-    //
-    // Ref image landmarks are in NORMAL (unmirrored) photo space.
-    // When we mirror the ref image (flip x), the eye centers mirror too:
-    //   mirrored refLE.x = W_ref - refLE.x  (now on the right)
-    //   mirrored refRE.x = W_ref - refRE.x  (now on the left)
-    //
-    // Eye-line direction in mirrored ref space:
-    //   dx_m = (W_ref - refRE.x) - (W_ref - refLE.x) = refLE.x - refRE.x = -refDx
-    //   dy_m = refDy  (unchanged)
-    //
-    // This matches the live eye-line direction (liveDx is also negative for a
-    // frontal face in mirrored camera), so rotation ≈ 0 for a straight face.
-
+  if (refLandmarks) {
     const rp = refLandmarks.positions;
 
     const liveLE = avg(lp.slice(36, 42));
@@ -232,39 +211,30 @@ function swapFace(
     const refDx  = refRE.x  - refLE.x;
     const refDy  = refRE.y  - refLE.y;
 
-    const liveED = Math.sqrt(liveDx * liveDx + liveDy * liveDy);
-    const refED  = Math.sqrt(refDx  * refDx  + refDy  * refDy);
-
+    const liveED = Math.hypot(liveDx, liveDy);
+    const refED  = Math.hypot(refDx,  refDy);
     if (refED < 1 || liveED < 1) { ctx.restore(); return; }
 
-    const scale = liveED / refED;
+    const scale    = liveED / refED;
+    // Mirrored ref eye-line direction is (-refDx, refDy)
+    const rot      = Math.atan2(liveDy, liveDx) - Math.atan2(refDy, -refDx);
+    const liveCx   = (liveLE.x + liveRE.x) / 2;
+    const liveCy   = (liveLE.y + liveRE.y) / 2;
+    const refCx    = (refLE.x  + refRE.x)  / 2;
+    const refCy    = (refLE.y  + refRE.y)  / 2;
+    const refCx_m  = W_ref - refCx; // mirrored eye-center x
 
-    // Rotation: angle of live eye-line minus angle of MIRRORED ref eye-line
-    // Mirrored ref eye-line direction: (-refDx, refDy)
-    const rot = Math.atan2(liveDy, liveDx) - Math.atan2(refDy, -refDx);
-
-    const liveCx = (liveLE.x + liveRE.x) / 2;
-    const liveCy = (liveLE.y + liveRE.y) / 2;
-    const refCx  = (refLE.x  + refRE.x)  / 2;
-    const refCy  = (refLE.y  + refRE.y)  / 2;
-
-    // Mirrored ref eye center x
-    const refCx_m = W_ref - refCx;
-
-    // Build transform: map mirrored ref eye-center → live eye-center
+    // Map mirrored ref eye-center → live eye-center
     ctx.translate(liveCx, liveCy);
     ctx.rotate(rot);
     ctx.scale(scale, scale);
     ctx.translate(-refCx_m, -refCy);
-
-    // Draw the ref image mirrored horizontally:
-    // ctx.scale(-1, 1) flips x; drawImage at (-W_ref, 0) places it at [0, W_ref]
+    // Flip ref image horizontally to match mirrored canvas
     ctx.scale(-1, 1);
     ctx.drawImage(refImg, -W_ref, 0);
 
   } else {
-    // ── FALLBACK MODE: bounding-box stretch, mirrored ─────────────────────────
-    // Translate to right edge of bounding box, flip x, draw stretched to box size
+    // Fallback: stretch ref image to bounding box, mirrored
     ctx.translate(bb.x + bb.width, bb.y);
     ctx.scale(-1, 1);
     ctx.drawImage(refImg, 0, 0, bb.width, bb.height);

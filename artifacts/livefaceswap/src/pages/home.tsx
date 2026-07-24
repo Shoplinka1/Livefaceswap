@@ -1,5 +1,8 @@
 import { useRef, useState, useEffect, useCallback } from 'react';
-import { ScanFace, CameraOff, Square, Upload, Video, StopCircle, Loader2, CheckCircle2, AlertCircle, Sparkles } from 'lucide-react';
+import {
+  ScanFace, CameraOff, Square, Upload, Video,
+  StopCircle, Loader2, CheckCircle2, AlertCircle, Sparkles
+} from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import { useCamera } from '@/hooks/useCamera';
 import { useFaceDetection } from '@/hooks/useFaceDetection';
@@ -9,6 +12,7 @@ import { FaceCanvas } from '@/components/FaceCanvas';
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const runningFileInputRef = useRef<HTMLInputElement>(null);
   const [refImageURL, setRefImageURL] = useState<string | null>(null);
   const [showControls, setShowControls] = useState(true);
   const hideTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -25,12 +29,12 @@ export default function Home() {
     refFaceStatus,
     setReferenceImage,
     startLoop,
-    stopLoop
+    stopLoop,
   } = useFaceDetection();
 
   const { isRecording, startRecording, stopRecording } = useRecorder(canvasRef.current);
 
-  // Auto-hide floating controls after 3.5s of no interaction while running
+  // Auto-hide controls after 3.5 s of inactivity while swap is running
   const resetHideTimer = useCallback(() => {
     setShowControls(true);
     if (hideTimeout.current) clearTimeout(hideTimeout.current);
@@ -47,42 +51,35 @@ export default function Home() {
     return () => { if (hideTimeout.current) clearTimeout(hideTimeout.current); };
   }, [isRunning, resetHideTimer]);
 
-  // Start camera + loop, waiting for the video to actually be ready
+  // Launch camera + render loop
   const launchSwap = useCallback(async () => {
+    if (isRunning) return;
     await startCamera();
-
-    // Wait for the video to signal it can play (more reliable than fixed timeout)
-    await new Promise<void>((resolve) => {
-      const vid = videoRef.current;
-      if (!vid) { resolve(); return; }
-      if (vid.readyState >= 2) { resolve(); return; }
-      const onReady = () => { vid.removeEventListener('canplay', onReady); resolve(); };
-      vid.addEventListener('canplay', onReady);
-      // Safety fallback
-      setTimeout(resolve, 3000);
-    });
-
+    // Give the video element a brief moment to start delivering frames
+    // after startCamera resolves (loadedmetadata is already awaited inside)
+    await new Promise(r => setTimeout(r, 200));
     if (videoRef.current && canvasRef.current) {
       startLoop(videoRef.current, canvasRef.current, () => {});
     }
-  }, [startCamera, startLoop, videoRef]);
+  }, [isRunning, startCamera, startLoop, videoRef]);
 
-  // Upload handler — starts swap immediately if models are ready
+  // Process an uploaded reference image, then auto-launch if not yet running
   const handleRefUpload = useCallback(async (file: File) => {
     const url = URL.createObjectURL(file);
     setRefImageURL(url);
+
     const img = new Image();
     img.src = url;
-    img.onload = () => setReferenceImage(img);
+    await new Promise<void>(resolve => { img.onload = () => resolve(); });
+    setReferenceImage(img);
 
-    // Auto-launch if models loaded and not already running
     if (modelsLoaded && !isRunning) {
       await launchSwap();
     }
   }, [setReferenceImage, modelsLoaded, isRunning, launchSwap]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
+    if (e.target.files?.[0]) {
       handleRefUpload(e.target.files[0]);
       e.target.value = '';
     }
@@ -94,34 +91,28 @@ export default function Home() {
     if (isRecording) stopRecording();
   };
 
-  // Warn if no face detected after a while
+  // Toast: no face after 5 s
   useEffect(() => {
-    let timeoutId: ReturnType<typeof setTimeout>;
-    if (isRunning && !faceDetected) {
-      timeoutId = setTimeout(() => {
-        toast({
-          title: 'No face detected',
-          description: 'Make sure your face is well-lit and centred in frame.',
-          variant: 'destructive',
-          duration: 3000,
-        });
-      }, 5000);
-    }
-    return () => clearTimeout(timeoutId);
+    if (!isRunning || faceDetected) return;
+    const id = setTimeout(() => {
+      toast({
+        title: 'No face detected',
+        description: 'Make sure your face is well-lit and centred in frame.',
+        variant: 'destructive',
+        duration: 3000,
+      });
+    }, 5000);
+    return () => clearTimeout(id);
   }, [isRunning, faceDetected, toast]);
 
+  // Toast: camera error
   useEffect(() => {
     if (cameraError) {
-      toast({
-        title: 'Camera error',
-        description: cameraError,
-        variant: 'destructive',
-        duration: 8000,
-      });
+      toast({ title: 'Camera error', description: cameraError, variant: 'destructive', duration: 8000 });
     }
   }, [cameraError, toast]);
 
-  // ── ACTIVE SWAP: fullscreen canvas + floating controls ────────────────────
+  // ── ACTIVE SWAP ────────────────────────────────────────────────────────────
   if (isRunning) {
     return (
       <div
@@ -129,7 +120,7 @@ export default function Home() {
         onPointerDown={resetHideTimer}
         onPointerMove={resetHideTimer}
       >
-        {/* Full-screen canvas */}
+        {/* Full-screen output canvas */}
         <FaceCanvas
           ref={canvasRef}
           videoRef={videoRef}
@@ -137,16 +128,16 @@ export default function Home() {
           className="absolute inset-0 w-full h-full object-cover"
         />
 
-        {/* Hidden file input for "Upload New" */}
+        {/* File input for swapping the reference mid-session */}
         <input
           type="file"
           accept="image/*"
           className="hidden"
-          ref={fileInputRef}
+          ref={runningFileInputRef}
           onChange={handleFileChange}
         />
 
-        {/* Face-detected indicator — top right */}
+        {/* Status indicator — top right */}
         <div className={`absolute top-4 right-4 transition-opacity duration-500 ${showControls ? 'opacity-100' : 'opacity-0'}`}>
           <div className={`px-3 py-1.5 rounded-full backdrop-blur-md border text-xs font-bold tracking-wider shadow-lg ${
             faceDetected
@@ -160,16 +151,12 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Blend slider — top left, compact */}
+        {/* Blend slider — top left */}
         <div className={`absolute top-4 left-4 transition-opacity duration-500 ${showControls ? 'opacity-100' : 'opacity-0'}`}>
           <div className="bg-black/50 backdrop-blur-xl border border-white/10 rounded-2xl px-4 py-2 flex items-center gap-3 w-44">
             <span className="text-xs text-white/50 shrink-0">Blend</span>
             <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={intensity}
+              type="range" min={0} max={1} step={0.01} value={intensity}
               onChange={e => setIntensity(parseFloat(e.target.value))}
               className="flex-1 accent-violet-500 h-1 rounded-full"
             />
@@ -181,25 +168,20 @@ export default function Home() {
         <div className={`absolute bottom-0 left-0 right-0 pb-10 px-6 flex justify-center gap-3 transition-all duration-500 ${
           showControls ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-8 pointer-events-none'
         }`}>
-          {/* Stop */}
           <button
             onClick={handleStop}
             className="flex items-center gap-2 px-5 py-3 bg-red-500/20 hover:bg-red-500 border border-red-500/50 text-red-400 hover:text-white rounded-2xl backdrop-blur-xl font-bold text-sm transition-all shadow-lg"
           >
-            <Square className="w-4 h-4 fill-current" />
-            STOP
+            <Square className="w-4 h-4 fill-current" /> STOP
           </button>
 
-          {/* Upload new face */}
           <button
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() => runningFileInputRef.current?.click()}
             className="flex items-center gap-2 px-5 py-3 bg-white/10 hover:bg-white/20 border border-white/20 text-white/80 hover:text-white rounded-2xl backdrop-blur-xl font-bold text-sm transition-all shadow-lg"
           >
-            <Upload className="w-4 h-4" />
-            NEW FACE
+            <Upload className="w-4 h-4" /> NEW FACE
           </button>
 
-          {/* Record */}
           <button
             onClick={isRecording ? stopRecording : startRecording}
             className={`flex items-center gap-2 px-5 py-3 border rounded-2xl backdrop-blur-xl font-bold text-sm transition-all shadow-lg ${
@@ -209,29 +191,19 @@ export default function Home() {
             }`}
           >
             {isRecording
-              ? <><StopCircle className="w-4 h-4" />REC</>
-              : <><Video className="w-4 h-4" />RECORD</>
-            }
+              ? <><StopCircle className="w-4 h-4" /> REC</>
+              : <><Video className="w-4 h-4" /> RECORD</>}
           </button>
         </div>
       </div>
     );
   }
 
-  // ── IDLE: upload screen ───────────────────────────────────────────────────
+  // ── IDLE / UPLOAD SCREEN ──────────────────────────────────────────────────
   return (
     <div className="min-h-[100dvh] w-full flex flex-col items-center justify-center bg-background p-6 gap-8 font-sans text-foreground">
-      {/* Header */}
-      <div className="flex items-center gap-3">
-        <div className="w-10 h-10 rounded-xl bg-primary/20 border border-primary/30 flex items-center justify-center backdrop-blur-md shadow-[0_0_20px_rgba(124,58,237,0.3)]">
-          <ScanFace className="w-6 h-6 text-primary" />
-        </div>
-        <h1 className="text-2xl font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-white/60">
-          LiveFaceSwap
-        </h1>
-      </div>
 
-      {/* Hidden video (needed for camera) */}
+      {/* FaceCanvas is kept in DOM so videoRef is always valid */}
       <FaceCanvas
         ref={canvasRef}
         videoRef={videoRef}
@@ -239,9 +211,20 @@ export default function Home() {
         className="hidden"
       />
 
-      {/* Upload card */}
+      {/* Header */}
+      <div className="flex items-center gap-3">
+        <div className="w-10 h-10 rounded-xl bg-primary/20 border border-primary/30 flex items-center justify-center shadow-[0_0_20px_rgba(124,58,237,0.3)]">
+          <ScanFace className="w-6 h-6 text-primary" />
+        </div>
+        <h1 className="text-2xl font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-white/60">
+          LiveFaceSwap
+        </h1>
+      </div>
+
       <div className="w-full max-w-sm flex flex-col gap-4">
-        {!modelsLoaded ? (
+
+        {/* AI model loading bar */}
+        {!modelsLoaded && (
           <div className="bg-black/30 border border-white/10 rounded-2xl p-5 flex flex-col gap-3">
             <div className="flex items-center justify-between text-sm text-muted-foreground">
               <span className="flex items-center gap-2">
@@ -257,9 +240,9 @@ export default function Home() {
               />
             </div>
           </div>
-        ) : null}
+        )}
 
-        {/* Upload button */}
+        {/* Upload zone */}
         <input
           type="file"
           accept="image/*"
@@ -271,36 +254,21 @@ export default function Home() {
         <button
           type="button"
           onClick={() => fileInputRef.current?.click()}
-          className="w-full h-48 border-2 border-dashed border-white/20 rounded-3xl flex items-center justify-center bg-black/20 hover:bg-black/40 hover:border-primary/50 transition-all group overflow-hidden relative"
+          className="w-full h-52 border-2 border-dashed border-white/20 rounded-3xl flex items-center justify-center bg-black/20 hover:bg-black/40 hover:border-primary/50 transition-all group overflow-hidden relative"
         >
           {refImageURL ? (
             <>
-              <img
-                src={refImageURL}
-                alt="Reference face"
-                className="absolute inset-0 w-full h-full object-cover"
-              />
+              <img src={refImageURL} alt="Reference" className="absolute inset-0 w-full h-full object-cover" />
               <div className="absolute inset-0 bg-black/50" />
               <div className="relative z-10 flex flex-col items-center gap-2">
                 {refFaceStatus === 'detecting' && (
-                  <>
-                    <Loader2 className="w-7 h-7 animate-spin text-white" />
-                    <span className="text-sm font-semibold text-white drop-shadow">Scanning face…</span>
-                  </>
+                  <><Loader2 className="w-7 h-7 animate-spin text-white" /><span className="text-sm font-semibold text-white drop-shadow">Scanning face…</span></>
                 )}
                 {refFaceStatus === 'ready' && (
-                  <>
-                    <CheckCircle2 className="w-8 h-8 text-green-400 drop-shadow-lg" />
-                    <span className="text-sm font-semibold text-green-300 drop-shadow">Face ready — tap to change</span>
-                  </>
+                  <><CheckCircle2 className="w-8 h-8 text-green-400" /><span className="text-sm font-semibold text-green-300">Face ready — tap to change</span></>
                 )}
                 {refFaceStatus === 'not_found' && (
-                  <>
-                    <AlertCircle className="w-8 h-8 text-amber-400 drop-shadow-lg" />
-                    <span className="text-sm font-semibold text-amber-300 drop-shadow text-center px-4">
-                      No face found — try a clearer photo
-                    </span>
-                  </>
+                  <><AlertCircle className="w-8 h-8 text-amber-400" /><span className="text-sm font-semibold text-amber-300 text-center px-4">No face found — try a clearer photo</span></>
                 )}
               </div>
             </>
@@ -310,30 +278,24 @@ export default function Home() {
                 <Upload className="w-7 h-7 text-primary" />
               </div>
               <div className="text-center">
-                <p className="text-base font-semibold text-white/80 group-hover:text-white transition-colors">
-                  Upload a face photo
-                </p>
-                <p className="text-sm text-white/40 mt-1">Clear, front-facing photo works best</p>
+                <p className="text-base font-semibold text-white/80 group-hover:text-white">Upload a face photo</p>
+                <p className="text-sm text-white/40 mt-1">Clear front-facing photo works best</p>
               </div>
             </div>
           )}
         </button>
 
-        {/* Manual start (in case auto-start didn't trigger) */}
-        {refImageURL && refFaceStatus !== 'detecting' && !isRunning && (
+        {/* Manual start fallback (auto-launch handles it on upload, but show if needed) */}
+        {refImageURL && refFaceStatus !== 'detecting' && modelsLoaded && !isRunning && (
           <button
             onClick={launchSwap}
-            className="w-full h-14 rounded-2xl flex items-center justify-center gap-2 bg-primary/20 text-primary border border-primary/30 hover:bg-primary hover:text-primary-foreground disabled:opacity-40 transition-all shadow-[0_0_15px_rgba(124,58,237,0.15)] hover:shadow-[0_0_30px_rgba(124,58,237,0.4)] font-bold text-base"
+            className="w-full h-14 rounded-2xl flex items-center justify-center gap-2 bg-primary/20 text-primary border border-primary/30 hover:bg-primary hover:text-primary-foreground transition-all font-bold text-base shadow-[0_0_15px_rgba(124,58,237,0.15)] hover:shadow-[0_0_30px_rgba(124,58,237,0.4)]"
           >
-            {isActive ? (
-              <><Sparkles className="w-5 h-5" /> START SWAP</>
-            ) : (
-              <><ScanFace className="w-5 h-5" /> START CAMERA & SWAP</>
-            )}
+            <Sparkles className="w-5 h-5" />
+            START SWAP
           </button>
         )}
 
-        {/* Camera inactive placeholder */}
         {!refImageURL && (
           <div className="flex items-center justify-center gap-2 text-white/30 text-sm">
             <CameraOff className="w-4 h-4" />

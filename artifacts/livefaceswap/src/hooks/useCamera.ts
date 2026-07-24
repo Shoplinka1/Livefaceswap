@@ -9,28 +9,40 @@ export function useCamera() {
   const startCamera = useCallback(async () => {
     try {
       setError(null);
-      const constraints = {
-        video: {
-          facingMode: 'user',
-          width: { ideal: 640 },
-          height: { ideal: 480 },
-          frameRate: { ideal: 30, max: 30 }
-        }
-      };
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+      // Start with minimal constraints to maximise mobile compatibility,
+      // then let the browser choose resolution.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user' },
+        audio: false,
+      });
+
       streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-      }
+      const vid = videoRef.current;
+      if (!vid) return;
+
+      vid.srcObject = stream;
+
+      // Wait for metadata so videoWidth/videoHeight are valid before we return
+      await new Promise<void>((resolve) => {
+        if (vid.readyState >= 1) { resolve(); return; }
+        const onMeta = () => { vid.removeEventListener('loadedmetadata', onMeta); resolve(); };
+        vid.addEventListener('loadedmetadata', onMeta);
+        setTimeout(resolve, 3000); // safety valve
+      });
+
+      // play() can throw on some browsers if called before metadata
+      try { await vid.play(); } catch { /* autoPlay attr handles it */ }
+
       setIsActive(true);
     } catch (err: any) {
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        setError('Camera permission denied. Please allow camera access in your browser settings.');
-      } else if (err.name === 'NotFoundError') {
+      const name = err?.name ?? '';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        setError('Camera permission denied — please allow camera access in your browser settings.');
+      } else if (name === 'NotFoundError') {
         setError('No camera found on this device.');
       } else {
-        setError('Could not start camera: ' + err.message);
+        setError('Could not start camera: ' + (err?.message ?? String(err)));
       }
     }
   }, []);

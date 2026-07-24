@@ -1,4 +1,4 @@
-import { useEffect, useRef, forwardRef, useImperativeHandle } from 'react';
+import { forwardRef, useImperativeHandle, useRef } from 'react';
 
 interface FaceCanvasProps {
   videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -6,35 +6,35 @@ interface FaceCanvasProps {
   className?: string;
 }
 
+// The video element MUST be rendered at a real size (not 1×1) so that mobile
+// browsers (especially Safari/iOS) actually decode the camera frames.
+// We position it fixed off-screen so it never appears in the UI.
+
 export const FaceCanvas = forwardRef<HTMLCanvasElement, FaceCanvasProps>(
-  ({ videoRef, isActive, className }, ref) => {
+  ({ videoRef, className }, ref) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     useImperativeHandle(ref, () => canvasRef.current!);
 
-    useEffect(() => {
-      const canvas = canvasRef.current;
-      if (!canvas || !isActive) return;
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        canvas.width = 640;
-        canvas.height = 480;
-      }
-    }, [isActive]);
-
     return (
       <>
-        {/* Hidden video element */}
+        {/* Off-screen video — real dimensions so mobile decodes frames */}
         <video
           ref={videoRef}
           autoPlay
           playsInline
           muted
-          style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', width: 1, height: 1 }}
+          style={{
+            position: 'fixed',
+            top: '-9999px',
+            left: '-9999px',
+            width: '640px',
+            height: '480px',
+            pointerEvents: 'none',
+          }}
         />
         <canvas
           ref={canvasRef}
           className={className}
-          style={{ maxWidth: '100%', maxHeight: '100%', borderRadius: 'inherit' }}
         />
       </>
     );
