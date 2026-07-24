@@ -151,6 +151,22 @@ export default function Home() {
           </div>
         </div>
 
+        {/* Face guidance ring — visible while searching, disappears once face is locked */}
+        {!faceDetected && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+            <div className="relative flex items-center justify-center">
+              {/* Animated oval guide */}
+              <div
+                className="rounded-full border-4 border-dashed border-white/40 animate-pulse"
+                style={{ width: 180, height: 230 }}
+              />
+              <span className="absolute bottom-[-36px] text-white/70 text-sm font-semibold text-center drop-shadow">
+                Point camera at your face
+              </span>
+            </div>
+          </div>
+        )}
+
         {/* Blend slider — top left */}
         <div className={`absolute top-4 left-4 transition-opacity duration-500 ${showControls ? 'opacity-100' : 'opacity-0'}`}>
           <div className="bg-black/50 backdrop-blur-xl border border-white/10 rounded-2xl px-4 py-2 flex items-center gap-3 w-44">
