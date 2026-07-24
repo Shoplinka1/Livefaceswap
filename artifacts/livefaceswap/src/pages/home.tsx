@@ -1,12 +1,10 @@
 import { useRef, useState, useEffect, useCallback } from 'react';
-import { ScanFace, CameraOff, Square, Upload, Video, StopCircle } from 'lucide-react';
+import { ScanFace, CameraOff, Square, Upload, Video, StopCircle, Loader2, CheckCircle2, AlertCircle, Sparkles } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import { useCamera } from '@/hooks/useCamera';
 import { useFaceDetection } from '@/hooks/useFaceDetection';
 import { useRecorder } from '@/hooks/useRecorder';
 import { FaceCanvas } from '@/components/FaceCanvas';
-import { ControlPanel } from '@/components/ControlPanel';
-import { OnboardingTips } from '@/components/OnboardingTips';
 
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -20,7 +18,6 @@ export default function Home() {
   const {
     modelsLoaded,
     loadingProgress,
-    loadError,
     isRunning,
     faceDetected,
     intensity,
@@ -33,7 +30,7 @@ export default function Home() {
 
   const { isRecording, startRecording, stopRecording } = useRecorder(canvasRef.current);
 
-  // Auto-hide floating controls after 3 s of no interaction
+  // Auto-hide floating controls after 3.5s of no interaction while running
   const resetHideTimer = useCallback(() => {
     setShowControls(true);
     if (hideTimeout.current) clearTimeout(hideTimeout.current);
@@ -50,13 +47,39 @@ export default function Home() {
     return () => { if (hideTimeout.current) clearTimeout(hideTimeout.current); };
   }, [isRunning, resetHideTimer]);
 
+  // Start camera + loop, waiting for the video to actually be ready
+  const launchSwap = useCallback(async () => {
+    await startCamera();
+
+    // Wait for the video to signal it can play (more reliable than fixed timeout)
+    await new Promise<void>((resolve) => {
+      const vid = videoRef.current;
+      if (!vid) { resolve(); return; }
+      if (vid.readyState >= 2) { resolve(); return; }
+      const onReady = () => { vid.removeEventListener('canplay', onReady); resolve(); };
+      vid.addEventListener('canplay', onReady);
+      // Safety fallback
+      setTimeout(resolve, 3000);
+    });
+
+    if (videoRef.current && canvasRef.current) {
+      startLoop(videoRef.current, canvasRef.current, () => {});
+    }
+  }, [startCamera, startLoop, videoRef]);
+
+  // Upload handler — starts swap immediately if models are ready
   const handleRefUpload = useCallback(async (file: File) => {
     const url = URL.createObjectURL(file);
     setRefImageURL(url);
     const img = new Image();
     img.src = url;
     img.onload = () => setReferenceImage(img);
-  }, [setReferenceImage]);
+
+    // Auto-launch if models loaded and not already running
+    if (modelsLoaded && !isRunning) {
+      await launchSwap();
+    }
+  }, [setReferenceImage, modelsLoaded, isRunning, launchSwap]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -65,56 +88,38 @@ export default function Home() {
     }
   };
 
-  const handleStart = async () => {
-    await startCamera();
-    setTimeout(() => {
-      if (videoRef.current && canvasRef.current) {
-        startLoop(videoRef.current, canvasRef.current, () => {});
-      }
-    }, 500);
-  };
-
   const handleStop = () => {
     stopLoop();
     stopCamera();
     if (isRecording) stopRecording();
   };
 
+  // Warn if no face detected after a while
   useEffect(() => {
     let timeoutId: ReturnType<typeof setTimeout>;
     if (isRunning && !faceDetected) {
       timeoutId = setTimeout(() => {
         toast({
           title: 'No face detected',
-          description: 'Make sure your face is in frame and well-lit.',
+          description: 'Make sure your face is well-lit and centred in frame.',
           variant: 'destructive',
           duration: 3000,
         });
-      }, 4000);
+      }, 5000);
     }
     return () => clearTimeout(timeoutId);
   }, [isRunning, faceDetected, toast]);
 
   useEffect(() => {
-    if (!navigator.mediaDevices) {
+    if (cameraError) {
       toast({
-        title: 'Camera not supported',
-        description: 'Your browser does not support camera access. Try Chrome or Safari.',
+        title: 'Camera error',
+        description: cameraError,
         variant: 'destructive',
-        duration: 10000,
-      });
-    }
-  }, [toast]);
-
-  useEffect(() => {
-    if (loadError) {
-      toast({
-        title: 'Preview limitation',
-        description: loadError,
         duration: 8000,
       });
     }
-  }, [loadError, toast]);
+  }, [cameraError, toast]);
 
   // ── ACTIVE SWAP: fullscreen canvas + floating controls ────────────────────
   if (isRunning) {
@@ -129,7 +134,7 @@ export default function Home() {
           ref={canvasRef}
           videoRef={videoRef}
           isActive={isActive}
-          className="w-full h-full object-cover"
+          className="absolute inset-0 w-full h-full object-cover"
         />
 
         {/* Hidden file input for "Upload New" */}
@@ -141,10 +146,8 @@ export default function Home() {
           onChange={handleFileChange}
         />
 
-        {/* Floating top-right: face-detected indicator */}
-        <div
-          className={`absolute top-4 right-4 transition-opacity duration-500 ${showControls ? 'opacity-100' : 'opacity-0'}`}
-        >
+        {/* Face-detected indicator — top right */}
+        <div className={`absolute top-4 right-4 transition-opacity duration-500 ${showControls ? 'opacity-100' : 'opacity-0'}`}>
           <div className={`px-3 py-1.5 rounded-full backdrop-blur-md border text-xs font-bold tracking-wider shadow-lg ${
             faceDetected
               ? 'bg-green-500/10 border-green-500/40 text-green-400'
@@ -152,23 +155,15 @@ export default function Home() {
           }`}>
             <div className="flex items-center gap-2">
               <span className={`w-2 h-2 rounded-full ${faceDetected ? 'bg-green-400' : 'bg-amber-400 animate-pulse'}`} />
-              {faceDetected ? 'LIVE' : 'NO FACE'}
+              {faceDetected ? 'LIVE' : 'SEARCHING…'}
             </div>
           </div>
         </div>
 
-        {/* Floating bottom bar */}
-        <div
-          className={`absolute bottom-0 left-0 right-0 pb-8 px-6 flex flex-col items-center gap-4 transition-all duration-500 ${
-            showControls ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-8 pointer-events-none'
-          }`}
-        >
-          {/* Intensity slider */}
-          <div className="w-full max-w-xs bg-black/50 backdrop-blur-xl border border-white/10 rounded-2xl px-5 py-3 flex flex-col gap-2">
-            <div className="flex justify-between items-center">
-              <span className="text-xs font-semibold text-white/60 uppercase tracking-wider">Blend</span>
-              <span className="text-xs font-bold text-white/90 font-mono">{Math.round(intensity * 100)}%</span>
-            </div>
+        {/* Blend slider — top left, compact */}
+        <div className={`absolute top-4 left-4 transition-opacity duration-500 ${showControls ? 'opacity-100' : 'opacity-0'}`}>
+          <div className="bg-black/50 backdrop-blur-xl border border-white/10 rounded-2xl px-4 py-2 flex items-center gap-3 w-44">
+            <span className="text-xs text-white/50 shrink-0">Blend</span>
             <input
               type="range"
               min={0}
@@ -176,112 +171,175 @@ export default function Home() {
               step={0.01}
               value={intensity}
               onChange={e => setIntensity(parseFloat(e.target.value))}
-              className="w-full accent-violet-500 h-1.5 rounded-full"
+              className="flex-1 accent-violet-500 h-1 rounded-full"
             />
+            <span className="text-xs text-white/70 font-mono w-7 text-right">{Math.round(intensity * 100)}%</span>
           </div>
+        </div>
 
-          {/* Action buttons */}
-          <div className="flex items-center gap-3">
-            {/* Stop */}
-            <button
-              onClick={handleStop}
-              className="flex items-center gap-2 px-5 py-3 bg-red-500/20 hover:bg-red-500 border border-red-500/50 text-red-400 hover:text-white rounded-2xl backdrop-blur-xl font-bold text-sm transition-all"
-            >
-              <Square className="w-4 h-4 fill-current" />
-              STOP
-            </button>
+        {/* Floating bottom buttons */}
+        <div className={`absolute bottom-0 left-0 right-0 pb-10 px-6 flex justify-center gap-3 transition-all duration-500 ${
+          showControls ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-8 pointer-events-none'
+        }`}>
+          {/* Stop */}
+          <button
+            onClick={handleStop}
+            className="flex items-center gap-2 px-5 py-3 bg-red-500/20 hover:bg-red-500 border border-red-500/50 text-red-400 hover:text-white rounded-2xl backdrop-blur-xl font-bold text-sm transition-all shadow-lg"
+          >
+            <Square className="w-4 h-4 fill-current" />
+            STOP
+          </button>
 
-            {/* Upload new face */}
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="flex items-center gap-2 px-5 py-3 bg-white/10 hover:bg-white/20 border border-white/20 text-white/80 hover:text-white rounded-2xl backdrop-blur-xl font-bold text-sm transition-all"
-            >
-              <Upload className="w-4 h-4" />
-              NEW FACE
-            </button>
+          {/* Upload new face */}
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            className="flex items-center gap-2 px-5 py-3 bg-white/10 hover:bg-white/20 border border-white/20 text-white/80 hover:text-white rounded-2xl backdrop-blur-xl font-bold text-sm transition-all shadow-lg"
+          >
+            <Upload className="w-4 h-4" />
+            NEW FACE
+          </button>
 
-            {/* Record */}
-            <button
-              onClick={isRecording ? stopRecording : startRecording}
-              className={`flex items-center gap-2 px-5 py-3 border rounded-2xl backdrop-blur-xl font-bold text-sm transition-all ${
-                isRecording
-                  ? 'bg-red-500/20 border-red-500/50 text-red-400 animate-pulse'
-                  : 'bg-white/10 hover:bg-white/20 border-white/20 text-white/80 hover:text-white'
-              }`}
-            >
-              {isRecording
-                ? <><StopCircle className="w-4 h-4" />REC</>
-                : <><Video className="w-4 h-4" />RECORD</>
-              }
-            </button>
-          </div>
+          {/* Record */}
+          <button
+            onClick={isRecording ? stopRecording : startRecording}
+            className={`flex items-center gap-2 px-5 py-3 border rounded-2xl backdrop-blur-xl font-bold text-sm transition-all shadow-lg ${
+              isRecording
+                ? 'bg-red-500/20 border-red-500/50 text-red-400 animate-pulse'
+                : 'bg-white/10 hover:bg-white/20 border-white/20 text-white/80 hover:text-white'
+            }`}
+          >
+            {isRecording
+              ? <><StopCircle className="w-4 h-4" />REC</>
+              : <><Video className="w-4 h-4" />RECORD</>
+            }
+          </button>
         </div>
       </div>
     );
   }
 
-  // ── IDLE: standard layout with control panel ──────────────────────────────
+  // ── IDLE: upload screen ───────────────────────────────────────────────────
   return (
-    <div className="min-h-[100dvh] w-full flex flex-col bg-background overflow-hidden relative font-sans text-foreground">
-      <OnboardingTips />
-
-      {/* Top Bar */}
-      <header className="absolute top-0 left-0 right-0 z-20 p-4 md:p-6 flex justify-between items-center bg-gradient-to-b from-black/80 to-transparent pointer-events-none">
-        <div className="flex items-center gap-2 pointer-events-auto">
-          <div className="w-8 h-8 rounded-lg bg-primary/20 border border-primary/30 flex items-center justify-center backdrop-blur-md shadow-[0_0_15px_rgba(124,58,237,0.3)]">
-            <ScanFace className="w-5 h-5 text-primary" />
-          </div>
-          <h1 className="text-xl font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-white/70">
-            LiveFaceSwap
-          </h1>
+    <div className="min-h-[100dvh] w-full flex flex-col items-center justify-center bg-background p-6 gap-8 font-sans text-foreground">
+      {/* Header */}
+      <div className="flex items-center gap-3">
+        <div className="w-10 h-10 rounded-xl bg-primary/20 border border-primary/30 flex items-center justify-center backdrop-blur-md shadow-[0_0_20px_rgba(124,58,237,0.3)]">
+          <ScanFace className="w-6 h-6 text-primary" />
         </div>
-      </header>
+        <h1 className="text-2xl font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-white/60">
+          LiveFaceSwap
+        </h1>
+      </div>
 
-      {/* Main Viewport */}
-      <main className="flex-1 relative flex items-center justify-center p-4 pt-20 pb-[200px] md:pb-32 h-full w-full">
-        <div className="relative w-full max-w-2xl aspect-[3/4] md:aspect-video rounded-3xl overflow-hidden bg-black shadow-2xl border border-white/5">
-          {/* No canvas needed while idle — just the placeholder */}
-          <FaceCanvas
-            ref={canvasRef}
-            videoRef={videoRef}
-            isActive={isActive}
-            className="w-full h-full object-cover transition-opacity duration-500"
-          />
+      {/* Hidden video (needed for camera) */}
+      <FaceCanvas
+        ref={canvasRef}
+        videoRef={videoRef}
+        isActive={isActive}
+        className="hidden"
+      />
 
-          {!isActive && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm gap-4 p-6 text-center animate-in fade-in duration-700">
-              <div className="w-20 h-20 rounded-full bg-white/5 border border-white/10 flex items-center justify-center mb-2">
-                <CameraOff className="w-8 h-8 text-white/50" />
+      {/* Upload card */}
+      <div className="w-full max-w-sm flex flex-col gap-4">
+        {!modelsLoaded ? (
+          <div className="bg-black/30 border border-white/10 rounded-2xl p-5 flex flex-col gap-3">
+            <div className="flex items-center justify-between text-sm text-muted-foreground">
+              <span className="flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin text-primary" />
+                Loading AI models…
+              </span>
+              <span className="font-mono">{loadingProgress}%</span>
+            </div>
+            <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-primary rounded-full transition-all duration-300"
+                style={{ width: `${loadingProgress}%` }}
+              />
+            </div>
+          </div>
+        ) : null}
+
+        {/* Upload button */}
+        <input
+          type="file"
+          accept="image/*"
+          className="hidden"
+          ref={fileInputRef}
+          onChange={handleFileChange}
+        />
+
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          className="w-full h-48 border-2 border-dashed border-white/20 rounded-3xl flex items-center justify-center bg-black/20 hover:bg-black/40 hover:border-primary/50 transition-all group overflow-hidden relative"
+        >
+          {refImageURL ? (
+            <>
+              <img
+                src={refImageURL}
+                alt="Reference face"
+                className="absolute inset-0 w-full h-full object-cover"
+              />
+              <div className="absolute inset-0 bg-black/50" />
+              <div className="relative z-10 flex flex-col items-center gap-2">
+                {refFaceStatus === 'detecting' && (
+                  <>
+                    <Loader2 className="w-7 h-7 animate-spin text-white" />
+                    <span className="text-sm font-semibold text-white drop-shadow">Scanning face…</span>
+                  </>
+                )}
+                {refFaceStatus === 'ready' && (
+                  <>
+                    <CheckCircle2 className="w-8 h-8 text-green-400 drop-shadow-lg" />
+                    <span className="text-sm font-semibold text-green-300 drop-shadow">Face ready — tap to change</span>
+                  </>
+                )}
+                {refFaceStatus === 'not_found' && (
+                  <>
+                    <AlertCircle className="w-8 h-8 text-amber-400 drop-shadow-lg" />
+                    <span className="text-sm font-semibold text-amber-300 drop-shadow text-center px-4">
+                      No face found — try a clearer photo
+                    </span>
+                  </>
+                )}
               </div>
-              <h2 className="text-2xl font-bold tracking-tight text-white/90">Camera Inactive</h2>
-              <p className="text-muted-foreground max-w-xs text-sm">
-                Upload a reference face image and tap Start to begin.
-              </p>
+            </>
+          ) : (
+            <div className="flex flex-col items-center gap-3">
+              <div className="w-16 h-16 rounded-full bg-primary/10 border border-primary/30 flex items-center justify-center group-hover:bg-primary/20 transition-colors">
+                <Upload className="w-7 h-7 text-primary" />
+              </div>
+              <div className="text-center">
+                <p className="text-base font-semibold text-white/80 group-hover:text-white transition-colors">
+                  Upload a face photo
+                </p>
+                <p className="text-sm text-white/40 mt-1">Clear, front-facing photo works best</p>
+              </div>
             </div>
           )}
-        </div>
-      </main>
+        </button>
 
-      {/* Control Panel Footer */}
-      <div className="absolute bottom-0 left-0 right-0 z-20">
-        <div className="max-w-2xl mx-auto md:mb-6">
-          <ControlPanel
-            modelsLoaded={modelsLoaded}
-            loadingProgress={loadingProgress}
-            isRunning={isRunning}
-            isRecording={isRecording}
-            intensity={intensity}
-            referenceImageURL={refImageURL}
-            refFaceStatus={refFaceStatus}
-            onUploadRef={handleRefUpload}
-            onStart={handleStart}
-            onStop={handleStop}
-            onSetIntensity={setIntensity}
-            onStartRecording={startRecording}
-            onStopRecording={stopRecording}
-            cameraError={cameraError}
-          />
-        </div>
+        {/* Manual start (in case auto-start didn't trigger) */}
+        {refImageURL && refFaceStatus !== 'detecting' && !isRunning && (
+          <button
+            onClick={launchSwap}
+            className="w-full h-14 rounded-2xl flex items-center justify-center gap-2 bg-primary/20 text-primary border border-primary/30 hover:bg-primary hover:text-primary-foreground disabled:opacity-40 transition-all shadow-[0_0_15px_rgba(124,58,237,0.15)] hover:shadow-[0_0_30px_rgba(124,58,237,0.4)] font-bold text-base"
+          >
+            {isActive ? (
+              <><Sparkles className="w-5 h-5" /> START SWAP</>
+            ) : (
+              <><ScanFace className="w-5 h-5" /> START CAMERA & SWAP</>
+            )}
+          </button>
+        )}
+
+        {/* Camera inactive placeholder */}
+        {!refImageURL && (
+          <div className="flex items-center justify-center gap-2 text-white/30 text-sm">
+            <CameraOff className="w-4 h-4" />
+            Camera starts automatically on upload
+          </div>
+        )}
       </div>
     </div>
   );
