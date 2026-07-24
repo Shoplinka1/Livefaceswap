@@ -25,6 +25,7 @@ export default function Home() {
     faceDetected,
     intensity,
     setIntensity,
+    refFaceStatus,
     setReferenceImage,
     startLoop,
     stopLoop
@@ -271,6 +272,7 @@ export default function Home() {
             isRecording={isRecording}
             intensity={intensity}
             referenceImageURL={refImageURL}
+            refFaceStatus={refFaceStatus}
             onUploadRef={handleRefUpload}
             onStart={handleStart}
             onStop={handleStop}
