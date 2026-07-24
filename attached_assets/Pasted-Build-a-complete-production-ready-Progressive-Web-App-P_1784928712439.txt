@@ -1,0 +1,46 @@
+Build a complete, production-ready Progressive Web App (PWA) called LiveFaceSwap.
+Core Goal
+A website that works perfectly on both iPhone Safari and Android Chrome. Users can:
+1.  Open the site on their phone
+2.  Upload any reference face image
+3.  Turn on their front camera
+4.  See real-time face swapping where their face is replaced by the uploaded face
+5.  The swapped face must mimic the user’s expressions, especially mouth movements, smiling, talking, and eye blinking as accurately as possible
+6.  The swapped video runs smoothly in the browser
+Technical Requirements
+•  Pure frontend only (no backend required)
+•  Use face-api.js + TensorFlow.js for face detection, landmarks, and swapping
+•  Use WebRTC (getUserMedia) for camera access
+•  Use Canvas API for real-time rendering of the swapped face
+•  Must work offline after first load (PWA with service worker)
+•  Fully responsive and optimized for mobile browsers (especially iOS Safari)
+•  All processing must run client-side on the device
+Advanced Face Swapping Requirements
+•  Perform real-time face detection + 68-point facial landmarks
+•  Transfer the expression and mouth shape from the live camera to the reference face
+•  The swapped face must open/close mouth, smile, and move when the user talks
+•  Use landmark-based warping + blending for the best possible expression transfer
+•  Add intensity slider so the user can control how strongly the expressions are applied
+•  Keep performance at 20–30 FPS on modern phones
+Features
+•  Clean dark modern UI
+•  Big “Upload Reference Face” button
+•  Live camera preview with the swapped result
+•  “Start Live Swap” / “Stop” buttons
+•  Intensity / Expression Strength slider
+•  Thumbnail of the uploaded reference image
+•  “Record” button that saves the swapped video to the phone’s gallery
+•  Clear error messages when face is not detected or camera permission is denied
+•  Simple onboarding tips shown the first time
+Important Constraints
+•  Must request camera permissions properly
+•  Handle iOS Safari limitations gracefully
+•  Prioritize performance and smoothness
+•  Start with a solid landmark-based expression transfer system
+•  Make the code clean, modular, and well-commented
+Deliverables
+1.  Full working source code
+2.  index.html, style.css, app.js (or clean modular structure)
+3.  Clear instructions on how to run it locally and how to deploy it (Netlify / Vercel / GitHub Pages)
+4.  Make it installable as a PWA on both iPhone and Android
+Start building the complete working version now with the best possible expression and mouth movement transfer.
