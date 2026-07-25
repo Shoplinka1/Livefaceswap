@@ -1,0 +1,1 @@
+- [LiveFaceSwap engine architecture](livefaceswap-engine.md) — avatar-first rendering; camera hidden, uploaded photo is the display; engine in src/engine/.
