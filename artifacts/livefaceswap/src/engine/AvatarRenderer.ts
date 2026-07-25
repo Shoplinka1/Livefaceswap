@@ -1,15 +1,15 @@
 /**
- * AvatarRenderer — draws one frame of the animated avatar to a canvas.
+ * AvatarRenderer v2 — draws one animated avatar frame to a canvas.
  *
- * The reference image is shown full-screen (cover-fit).
- * Facial parameters drive:
- *   • Head rotation / tilt / bob  (canvas transform)
- *   • Mouth open/close            (split-image technique)
- *   • Eye blink                   (eyelid overlay)
- *   • Eyebrow raise               (subtle region shift)
- *
- * The render method is designed to be called from requestAnimationFrame
- * every frame (~60 fps) without any allocations or re-initialisations.
+ * Key design decisions:
+ *  • The canvas is always full-screen (cover-fit reference image).
+ *  • All face animations are LOCALISED to the face region — nothing outside
+ *    the face shifts when the mouth opens or eyes blink.
+ *  • Mouth open: face-column-constrained split so only the jaw area moves.
+ *  • Eye blink: upper eyelid skin-texture overlay, alpha-blended.
+ *  • Eyebrow raise: whole-image translate clipped to brow strip.
+ *  • Head pose: global canvas transform applied before drawing.
+ *  • "Face not detected" subtle text indicator (no heavy overlay).
  */
 import * as faceapi from '@vladmandic/face-api';
 import type { FaceParams, RefFaceData } from './types';
@@ -17,29 +17,38 @@ import { DEFAULT_PARAMS } from './types';
 
 const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model';
 
-// ─── Utility ────────────────────────────────────────────────────────────────
+// ─── Utilities ────────────────────────────────────────────────────────────────
 
-interface CoverTransform {
+interface Cover {
   scale: number;
-  dx: number;   // left offset (canvas px)
-  dy: number;   // top offset (canvas px)
+  dx: number;
+  dy: number;
 }
 
-function coverTransform(imgW: number, imgH: number, cW: number, cH: number): CoverTransform {
+function buildCover(imgW: number, imgH: number, cW: number, cH: number): Cover {
   const scale = Math.max(cW / imgW, cH / imgH);
-  return {
-    scale,
-    dx: (cW - imgW * scale) / 2,
-    dy: (cH - imgH * scale) / 2,
-  };
+  return { scale, dx: (cW - imgW * scale) / 2, dy: (cH - imgH * scale) / 2 };
 }
 
-/** Map a ref-image pixel coordinate to canvas coordinates */
-function toCanvas(x: number, y: number, t: CoverTransform) {
+function c2c(x: number, y: number, t: Cover) {
   return { x: x * t.scale + t.dx, y: y * t.scale + t.dy };
 }
 
-// ─── AvatarRenderer class ────────────────────────────────────────────────────
+function imgRect(cover: Cover, iW: number, iH: number) {
+  return { x: cover.dx, y: cover.dy, w: iW * cover.scale, h: iH * cover.scale };
+}
+
+// Convert canvas coords back to image-source coords for ctx.drawImage sub-rect
+function canvasToSrc(cx: number, cy: number, cw: number, ch: number, cover: Cover) {
+  return {
+    sx: (cx - cover.dx) / cover.scale,
+    sy: (cy - cover.dy) / cover.scale,
+    sw: cw / cover.scale,
+    sh: ch / cover.scale,
+  };
+}
+
+// ─── AvatarRenderer ───────────────────────────────────────────────────────────
 
 export class AvatarRenderer {
   readonly canvas: HTMLCanvasElement;
@@ -52,46 +61,35 @@ export class AvatarRenderer {
     this.ctx = canvas.getContext('2d', { alpha: false })!;
   }
 
-  // ── Reference face ─────────────────────────────────────────────────────────
+  setRefFace(data: RefFaceData | null): void { this.ref = data; }
 
-  setRefFace(data: RefFaceData | null): void {
-    this.ref = data;
-  }
-
-  /** Detect 68-pt landmarks in the reference image (call once after upload). */
+  /** Detect landmarks in the reference image (call once per upload). */
   async detectRefLandmarks(img: HTMLImageElement): Promise<Array<{ x: number; y: number }> | null> {
-    for (const threshold of [0.3, 0.2, 0.1, 0.05]) {
+    for (const t of [0.3, 0.2, 0.1, 0.05]) {
       try {
         const det = await faceapi
-          .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({ scoreThreshold: threshold }))
+          .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({ scoreThreshold: t }))
           .withFaceLandmarks(true);
-        if (det) {
-          return det.landmarks.positions.map(p => ({ x: p.x, y: p.y }));
-        }
-      } catch { /* try lower threshold */ }
+        if (det) return det.landmarks.positions.map(p => ({ x: p.x, y: p.y }));
+      } catch { /* lower threshold */ }
     }
     return null;
   }
-
-  // ── Main render ────────────────────────────────────────────────────────────
 
   render(params: FaceParams): void {
     this.lastParams = params;
     this.drawFrame(params);
   }
 
-  /** Draw the latest frame again (used for freeze on tracking loss). */
-  redraw(): void {
-    this.drawFrame(this.lastParams);
-  }
+  // ── Core draw ──────────────────────────────────────────────────────────────
 
   private drawFrame(params: FaceParams): void {
     const canvas = this.canvas;
     const ctx    = this.ctx;
 
-    // Sync canvas pixel size to CSS size
-    const cW = canvas.clientWidth  || canvas.width;
-    const cH = canvas.clientHeight || canvas.height;
+    // Sync pixel dimensions to CSS size (window fallback for first mobile frame)
+    const cW = canvas.clientWidth  || window.innerWidth;
+    const cH = canvas.clientHeight || window.innerHeight;
     if (canvas.width !== cW || canvas.height !== cH) {
       canvas.width  = cW;
       canvas.height = cH;
@@ -101,20 +99,22 @@ export class AvatarRenderer {
     ctx.fillRect(0, 0, cW, cH);
 
     const ref = this.ref;
-    if (!ref || !ref.image.naturalWidth) return;
+    if (!ref || !ref.image.naturalWidth) {
+      // No avatar yet — nothing to draw
+      return;
+    }
 
     const { image, landmarks } = ref;
-    const cover = coverTransform(image.naturalWidth, image.naturalHeight, cW, cH);
+    const cover  = buildCover(image.naturalWidth, image.naturalHeight, cW, cH);
+    const ir     = imgRect(cover, image.naturalWidth, image.naturalHeight);
 
-    // ── Head transform ─────────────────────────────────────────────────────
-    // Pivot around the visual face centre (slightly above canvas centre)
+    // ── Head pose transform ────────────────────────────────────────────────
     const pivotX = cW * 0.5;
-    const pivotY = cH * 0.45;
-
-    const maxBob = cW  * 0.07;  // max horizontal sway pixels
-    const maxNod = cH  * 0.05;  // max vertical nod pixels
-    const txPx   = -params.yaw   * maxBob;  // yaw right → image shifts left
-    const tyPx   =  params.pitch * maxNod;  // pitch down → image shifts down
+    const pivotY = cH * 0.44;
+    const maxBob = cW * 0.06;
+    const maxNod = cH * 0.045;
+    const txPx   = -params.yaw   * maxBob;
+    const tyPx   =  params.pitch * maxNod;
 
     ctx.save();
     ctx.translate(pivotX + txPx, pivotY + tyPx);
@@ -122,123 +122,137 @@ export class AvatarRenderer {
     ctx.translate(-pivotX, -pivotY);
 
     if (landmarks && landmarks.length >= 68) {
-      this.renderPuppet(ctx, image, landmarks, cover, cW, cH, params);
+      this.drawPuppet(ctx, image, ir, landmarks, cover, cW, cH, params);
     } else {
-      // No ref landmarks — just draw the image with head motion
-      ctx.drawImage(
-        image,
-        cover.dx, cover.dy,
-        image.naturalWidth  * cover.scale,
-        image.naturalHeight * cover.scale
-      );
+      ctx.drawImage(image, ir.x, ir.y, ir.w, ir.h);
     }
 
     ctx.restore();
 
-    // ── Searching indicator (no tracking) ─────────────────────────────────
+    // ── "Face not detected" subtle indicator ───────────────────────────────
     if (!params.detected) {
-      ctx.fillStyle = 'rgba(0,0,0,0.25)';
-      ctx.fillRect(0, 0, cW, cH);
+      ctx.save();
+      ctx.font = 'bold 14px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      // Badge
+      const text  = 'Face not detected';
+      const tw    = ctx.measureText(text).width;
+      const bx    = cW / 2 - tw / 2 - 12;
+      const by    = cH  - 56;
+      const bw    = tw + 24;
+      const bh    = 32;
+      ctx.fillStyle   = 'rgba(0,0,0,0.55)';
+      ctx.beginPath();
+      ctx.roundRect(bx, by, bw, bh, 8);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,220,80,0.85)';
+      ctx.fillText(text, cW / 2, by + 21);
+      ctx.restore();
     }
   }
 
-  // ── Puppet rendering ───────────────────────────────────────────────────────
+  // ── Puppet (full expression animation) ───────────────────────────────────
 
-  private renderPuppet(
+  private drawPuppet(
     ctx: CanvasRenderingContext2D,
     image: HTMLImageElement,
+    ir: { x: number; y: number; w: number; h: number },
     lm: Array<{ x: number; y: number }>,
-    cover: CoverTransform,
+    cover: Cover,
     cW: number,
     cH: number,
     params: FaceParams
   ): void {
-    const toLm = (i: number) => toCanvas(lm[i].x, lm[i].y, cover);
+    const lmC = (i: number) => c2c(lm[i].x, lm[i].y, cover);
 
-    const imgX = cover.dx;
-    const imgY = cover.dy;
-    const imgW = image.naturalWidth  * cover.scale;
-    const imgH = image.naturalHeight * cover.scale;
+    // ── Compute face column bounds from jaw landmarks (0-16) ──────────────
+    const jawXs = Array.from({ length: 17 }, (_, i) => lmC(i).x);
+    const faceMinX = Math.min(...jawXs) - ir.w * 0.04;
+    const faceMaxX = Math.max(...jawXs) + ir.w * 0.04;
+    const faceColW = faceMaxX - faceMinX;
 
-    // Key mouth landmarks in canvas space
-    const upperLipInner = toLm(62);  // inner upper lip centre
-    const lowerLipInner = toLm(66);  // inner lower lip centre
-    const mouthLeft     = toLm(48);
-    const mouthRight    = toLm(54);
-    const mouthCX       = (mouthLeft.x + mouthRight.x) / 2;
-    const mouthCY       = (upperLipInner.y + lowerLipInner.y) / 2;
-    const mouthW        = Math.abs(mouthRight.x - mouthLeft.x);
+    // ── Key landmarks ──────────────────────────────────────────────────────
+    const ulInner   = lmC(62);  // inner upper lip centre
+    const llInner   = lmC(66);  // inner lower lip centre
+    const mLeft     = lmC(48);
+    const mRight    = lmC(54);
+    const mCX       = (mLeft.x + mRight.x) / 2;
+    const mWidth    = Math.abs(mRight.x - mLeft.x);
+    const splitY    = (ulInner.y + llInner.y) / 2;
+    const natGap    = Math.max(2, llInner.y - ulInner.y);
+    const maxGap    = natGap * 4.5;
+    const gap       = params.mouthOpen * maxGap;
 
-    // Gap in canvas pixels (how far the lower face drops when mouth opens)
-    const naturalLipGap = Math.max(0, lowerLipInner.y - upperLipInner.y);
-    const maxGap        = Math.max(naturalLipGap * 3, imgH * 0.06);
-    const gap           = params.mouthOpen * maxGap;
+    // ── Step 1: draw the full reference image ──────────────────────────────
+    ctx.drawImage(image, ir.x, ir.y, ir.w, ir.h);
 
-    // ── Image split (mouth animation) ─────────────────────────────────────
-    const splitY = mouthCY;
-
-    if (gap < 2) {
-      // Mouth closed — draw whole image
-      ctx.drawImage(image, imgX, imgY, imgW, imgH);
-    } else {
-      // Upper portion (above split)
+    // ── Step 2: mouth-open jaw drop (face-column-constrained) ─────────────
+    if (gap > 1) {
+      // Re-draw only the jaw region (below splitY, within face column) shifted down
       ctx.save();
       ctx.beginPath();
-      ctx.rect(0, 0, cW, splitY);
-      ctx.clip();
-      ctx.drawImage(image, imgX, imgY, imgW, imgH);
-      ctx.restore();
-
-      // Lower portion (below split) — shifted down by gap
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(0, splitY, cW, cH - splitY);
+      ctx.rect(faceMinX, splitY, faceColW, cH - splitY);
       ctx.clip();
       ctx.translate(0, gap);
-      ctx.drawImage(image, imgX, imgY, imgW, imgH);
+      ctx.drawImage(image, ir.x, ir.y, ir.w, ir.h);
       ctx.restore();
 
-      // Dark "open mouth" ellipse in the gap
+      // Dark mouth-cavity ellipse filling the gap
       ctx.save();
       ctx.beginPath();
       ctx.ellipse(
-        mouthCX, splitY + gap / 2,
-        mouthW / 2 + 4, gap / 2 + 3,
+        mCX, splitY + gap / 2,
+        mWidth / 2 + 3, gap / 2 + 3,
         0, 0, Math.PI * 2
       );
-      ctx.fillStyle = '#080808';
+      ctx.fillStyle = '#050505';
       ctx.fill();
+      ctx.restore();
+
+      // Thin lip line softens the seam between upper face and jaw
+      ctx.save();
+      ctx.globalAlpha = 0.35;
+      const { sx, sy, sw, sh } = canvasToSrc(
+        faceMinX, splitY - 6, faceColW, 12, cover
+      );
+      if (sw > 0 && sh > 0) {
+        ctx.drawImage(image, sx, sy, sw, sh, faceMinX, splitY - 6, faceColW, 12);
+      }
       ctx.restore();
     }
 
-    // ── Eye blink overlays ─────────────────────────────────────────────────
-    // Left eye in ref image = landmarks 36-41
-    // Right eye in ref image = landmarks 42-47
-    // Note: in the ref photo these are the actual anatomical eyes (not mirrored)
-    this.renderEyelid(ctx, image, lm, cover, 36, 1 - params.leftEyeOpen);
-    this.renderEyelid(ctx, image, lm, cover, 42, 1 - params.rightEyeOpen);
+    // ── Step 3: eye blink overlays ─────────────────────────────────────────
+    this.drawEyelid(ctx, image, lm, cover, ir, 36, 1 - params.leftEyeOpen);
+    this.drawEyelid(ctx, image, lm, cover, ir, 42, 1 - params.rightEyeOpen);
 
-    // ── Eyebrow raise ──────────────────────────────────────────────────────
-    if (params.eyebrowRaise > 0.1) {
-      this.renderEyebrowRaise(ctx, image, lm, cover, cW, params.eyebrowRaise);
+    // ── Step 4: eyebrow raise ──────────────────────────────────────────────
+    if (params.eyebrowRaise > 0.08) {
+      this.drawBrowRaise(ctx, image, lm, cover, ir, params.eyebrowRaise);
+    }
+
+    // ── Step 5: smile cheek lift (subtle) ─────────────────────────────────
+    if (params.smile > 0.25) {
+      this.drawSmile(ctx, image, lm, cover, ir, params.smile);
     }
   }
 
-  // ── Eyelid closing ────────────────────────────────────────────────────────
+  // ── Eyelid animation ──────────────────────────────────────────────────────
+  // Upper eyelid descends from the top of the eye using skin texture
+  // from the forehead region above, alpha-blended for soft edges.
 
-  private renderEyelid(
+  private drawEyelid(
     ctx: CanvasRenderingContext2D,
     image: HTMLImageElement,
     lm: Array<{ x: number; y: number }>,
-    cover: CoverTransform,
+    cover: Cover,
+    ir: { x: number; y: number; w: number; h: number },
     eyeStart: number,
-    closedness: number   // 0 = open, 1 = fully closed
+    closedness: number
   ): void {
-    if (closedness < 0.12) return;
+    if (closedness < 0.08) return;
 
-    const toLm = (i: number) => toCanvas(lm[i].x, lm[i].y, cover);
-    const pts  = [0, 1, 2, 3, 4, 5].map(i => toLm(eyeStart + i));
-
+    const lmC    = (i: number) => c2c(lm[i].x, lm[i].y, cover);
+    const pts    = [0, 1, 2, 3, 4, 5].map(i => lmC(eyeStart + i));
     const leftX  = pts[0].x;
     const rightX = pts[3].x;
     const eyeW   = Math.abs(rightX - leftX);
@@ -246,85 +260,100 @@ export class AvatarRenderer {
     const botY   = Math.max(...pts.map(p => p.y));
     const eyeH   = Math.max(botY - topY, 4);
     const eyeCX  = (leftX + rightX) / 2;
-    const eyeCY  = (topY  + botY)   / 2;
 
-    // Draw closing eyelid by painting skin texture from just above the eye
-    // (clipped to a shrinking ellipse that represents the eyelid)
+    const padX    = eyeW * 0.3;
+    const lidH    = closedness * (eyeH + 2);
+
+    // Clip to the eye bounding area
     ctx.save();
     ctx.beginPath();
-    ctx.ellipse(
-      eyeCX, eyeCY,
-      eyeW / 2 + 3,
-      (eyeH / 2 + 4) * closedness,
-      0, 0, Math.PI * 2
-    );
+    ctx.rect(leftX - padX, topY - 2, eyeW + padX * 2, eyeH + 4);
     ctx.clip();
 
-    // Source from the forehead region of the ref image (skin texture = natural eyelid)
-    const pad    = eyeW * 0.5;
-    const srcX   = Math.max(0, (leftX  - pad     - cover.dx) / cover.scale);
-    const srcY   = Math.max(0, (eyeCY  - eyeH * 2.5 - cover.dy) / cover.scale);
-    const srcW   = Math.max(1, (eyeW + pad * 2) / cover.scale);
-    const srcH   = Math.max(1, (eyeH * 3) / cover.scale);
+    // The eyelid texture: the image region just ABOVE the eye (skin / forehead)
+    // shifted DOWN to cover the eye as the lid closes.
+    // We draw the image shifted down by lidH, which moves the skin above the
+    // eye down over the eye area = natural upper-eyelid appearance.
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, closedness * 1.3);
+    ctx.translate(0, lidH);
+    ctx.drawImage(image, ir.x, ir.y, ir.w, ir.h);
+    ctx.restore();
 
-    ctx.drawImage(
-      image,
-      srcX, srcY, srcW, srcH,
-      leftX - pad, eyeCY - eyeH * 2.5,
-      eyeW + pad * 2, eyeH * 3
-    );
     ctx.restore();
   }
 
   // ── Eyebrow raise ─────────────────────────────────────────────────────────
+  // Translate the image up by shiftPx within the brow strip clip region.
+  // Clipping prevents the shift from bleeding outside the brow area.
+  // The gap left below is automatically filled by the underlying full image.
 
-  private renderEyebrowRaise(
+  private drawBrowRaise(
     ctx: CanvasRenderingContext2D,
     image: HTMLImageElement,
     lm: Array<{ x: number; y: number }>,
-    cover: CoverTransform,
-    cW: number,
-    raise: number   // 0–1
+    cover: Cover,
+    ir: { x: number; y: number; w: number; h: number },
+    raise: number
   ): void {
-    // Bounding box of both eyebrows + some forehead above them
-    const leftBrowPts  = [17, 18, 19, 20, 21].map(i => toCanvas(lm[i].x, lm[i].y, cover));
-    const rightBrowPts = [22, 23, 24, 25, 26].map(i => toCanvas(lm[i].x, lm[i].y, cover));
-    const allPts = [...leftBrowPts, ...rightBrowPts];
+    const lmC     = (i: number) => c2c(lm[i].x, lm[i].y, cover);
+    const lBrow   = [17, 18, 19, 20, 21].map(lmC);
+    const rBrow   = [22, 23, 24, 25, 26].map(lmC);
+    const all     = [...lBrow, ...rBrow];
+    const minX    = Math.min(...all.map(p => p.x)) - ir.w * 0.02;
+    const maxX    = Math.max(...all.map(p => p.x)) + ir.w * 0.02;
+    const minY    = Math.min(...all.map(p => p.y)) - ir.h * 0.04;
+    const maxY    = Math.max(...all.map(p => p.y)) + ir.h * 0.015;
+    const stripW  = maxX - minX;
+    const stripH  = maxY - minY;
+    if (stripW < 2 || stripH < 2) return;
 
-    const minX = Math.min(...allPts.map(p => p.x)) - 8;
-    const maxX = Math.max(...allPts.map(p => p.x)) + 8;
-    const minY = Math.min(...allPts.map(p => p.y)) - 14;
-    const maxY = Math.max(...allPts.map(p => p.y)) + 4;
-
-    const regionW = maxX - minX;
-    const regionH = maxY - minY;
-    if (regionW < 4 || regionH < 4) return;
-
-    const shiftUp = raise * regionH * 0.4;  // pixels upward
-
-    // Re-draw the eyebrow strip shifted upward
-    const srcX = Math.max(0, (minX - cover.dx) / cover.scale);
-    const srcY = Math.max(0, (minY - cover.dy) / cover.scale);
-    const srcW = Math.max(1, regionW / cover.scale);
-    const srcH = Math.max(1, regionH / cover.scale);
+    const shiftUp = raise * stripH * 0.55;
 
     ctx.save();
-    // Clip to only the brow region so the shifted copy doesn't bleed into surrounding area
+    // Clip to brow strip + headroom above for the upward shift
     ctx.beginPath();
-    ctx.rect(minX, minY - shiftUp - 4, regionW, regionH + 4);
+    ctx.rect(minX, minY - shiftUp - 2, stripW, stripH + shiftUp + 2);
     ctx.clip();
-
-    // First cover the original position with the image (in case it moved)
-    ctx.drawImage(image,
-      srcX, srcY, srcW, srcH,
-      minX, minY, regionW, regionH
-    );
-
-    // Then draw the brow shifted upward
-    ctx.drawImage(image,
-      srcX, srcY, srcW, srcH,
-      minX, minY - shiftUp, regionW, regionH
-    );
+    // Translate the whole image up: brow moves up, gap below shows forehead texture
+    ctx.translate(0, -shiftUp);
+    ctx.drawImage(image, ir.x, ir.y, ir.w, ir.h);
     ctx.restore();
+  }
+
+  // ── Smile cheek lift (subtle upward push of cheek area) ──────────────────
+
+  private drawSmile(
+    ctx: CanvasRenderingContext2D,
+    image: HTMLImageElement,
+    lm: Array<{ x: number; y: number }>,
+    cover: Cover,
+    ir: { x: number; y: number; w: number; h: number },
+    smile: number
+  ): void {
+    // Mouth corners lift very slightly — shift the corner regions upward
+    const lmC = (i: number) => c2c(lm[i].x, lm[i].y, cover);
+    const corners = [lmC(48), lmC(54)];
+    const mTop    = lmC(51);
+    const mBot    = lmC(57);
+    const regionH = Math.abs(mBot.y - mTop.y) * 2.5;
+    const liftPx  = smile * regionH * 0.18;
+    if (liftPx < 0.5) return;
+
+    for (const corner of corners) {
+      const rx = corner.x - ir.w * 0.06;
+      const ry = corner.y - regionH * 0.4;
+      const rw = ir.w * 0.12;
+      const rh = regionH;
+      if (rw < 2 || rh < 2) continue;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(rx, ry - liftPx, rw, rh + liftPx);
+      ctx.clip();
+      ctx.globalAlpha = 0.7;
+      ctx.translate(0, -liftPx);
+      ctx.drawImage(image, ir.x, ir.y, ir.w, ir.h);
+      ctx.restore();
+    }
   }
 }

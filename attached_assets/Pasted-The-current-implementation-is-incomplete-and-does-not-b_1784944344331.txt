@@ -1,0 +1,125 @@
+The current implementation is incomplete and does not behave as intended.
+
+Problems
+	•	The uploaded avatar image only rotates, scales or drifts.
+	•	Facial expressions are not transferred.
+	•	Blinking is not tracked.
+	•	Mouth movement while talking is not animated.
+	•	Eyebrows do not move.
+	•	Head tracking is unstable.
+	•	Rendering is not full screen.
+	•	Camera preview is incorrectly displayed instead of only using it for tracking.
+
+Required Changes
+
+Face Tracking
+
+Implement proper real-time tracking using facial landmarks.
+
+Track:
+	•	Head yaw
+	•	Head pitch
+	•	Head roll
+	•	Face position
+	•	Eye blinking
+	•	Mouth openness
+	•	Smile
+	•	Eyebrows
+
+Smooth all landmark values with temporal filtering.
+
+⸻
+
+Avatar Rendering
+
+Render the uploaded avatar as a full-screen animated avatar.
+
+Requirements:
+	•	Hide the live camera preview.
+	•	Camera is only used for tracking.
+	•	Avatar fills the screen while preserving aspect ratio.
+	•	Avatar animation responds naturally to tracked expressions.
+	•	Freeze the last valid pose if tracking is temporarily lost.
+
+⸻
+
+Rendering Pipeline
+
+Refactor into independent modules:
+
+CameraManager
+FaceTracker
+ExpressionTracker
+AvatarRenderer
+AnimationController
+RecordingManager
+UIOverlay
+
+The render loop must run independently from React state updates.
+
+⸻
+
+UI
+
+Display only floating controls:
+	•	Stop
+	•	Upload New Avatar
+	•	Record
+
+Remove any placeholder overlays or static preview elements.
+
+⸻
+
+Performance
+
+Optimise for:
+	•	30–60 FPS
+	•	Low latency
+	•	Stable animation
+	•	Minimal frame drops
+
+Avoid unnecessary React re-renders.
+
+⸻
+
+Recording
+
+Record the animated avatar output.
+
+Export high-quality MP4.
+
+⸻
+
+Error Handling
+
+If no face is detected:
+	•	Keep rendering the last valid avatar pose.
+	•	Display a subtle “Face not detected” indicator.
+	•	Automatically resume animation when tracking returns.
+
+⸻
+
+Testing
+
+Verify:
+	•	Upload avatar.
+	•	Live tracking.
+	•	Stable animation.
+	•	Recording.
+	•	iPhone Safari compatibility.
+	•	Mobile responsiveness.
+
+Fix all bugs before completion.
+
+⸻
+
+GitHub
+
+After completing all work:
+	•	Run lint.
+	•	Fix all TypeScript errors.
+	•	Fix all build errors.
+	•	Verify production build succeeds.
+	•	Commit all changes with descriptive commit messages.
+	•	Push the final version to the GitHub repository.
+	•	Return a summary of every file changed and every bug fixed.
