@@ -5,8 +5,11 @@
  *  • The canvas is always full-screen (cover-fit reference image).
  *  • All face animations are LOCALISED to the face region — nothing outside
  *    the face shifts when the mouth opens or eyes blink.
- *  • Mouth open: face-column-constrained split so only the jaw area moves.
- *  • Eye blink: upper eyelid skin-texture overlay, alpha-blended.
+ *  • Mouth open: face-column-constrained jaw drop; gap sized to face height
+ *    (not raw landmark gap) so it's stable at any camera distance.
+ *  • Eye blink: progressive upper-eyelid cover — the clip region grows
+ *    downward as closedness increases, never using alpha blending, giving a
+ *    sharp natural lid descent from full-opacity skin texture above the eye.
  *  • Eyebrow raise: whole-image translate clipped to brow strip.
  *  • Head pose: global canvas transform applied before drawing.
  *  • "Face not detected" subtle text indicator (no heavy overlay).
@@ -166,22 +169,29 @@ export class AvatarRenderer {
     const lmC = (i: number) => c2c(lm[i].x, lm[i].y, cover);
 
     // ── Compute face column bounds from jaw landmarks (0-16) ──────────────
-    const jawXs = Array.from({ length: 17 }, (_, i) => lmC(i).x);
+    const jawXs    = Array.from({ length: 17 }, (_, i) => lmC(i).x);
     const faceMinX = Math.min(...jawXs) - ir.w * 0.04;
     const faceMaxX = Math.max(...jawXs) + ir.w * 0.04;
     const faceColW = faceMaxX - faceMinX;
 
     // ── Key landmarks ──────────────────────────────────────────────────────
-    const ulInner   = lmC(62);  // inner upper lip centre
-    const llInner   = lmC(66);  // inner lower lip centre
-    const mLeft     = lmC(48);
-    const mRight    = lmC(54);
-    const mCX       = (mLeft.x + mRight.x) / 2;
-    const mWidth    = Math.abs(mRight.x - mLeft.x);
-    const splitY    = (ulInner.y + llInner.y) / 2;
-    const natGap    = Math.max(2, llInner.y - ulInner.y);
-    const maxGap    = natGap * 4.5;
-    const gap       = params.mouthOpen * maxGap;
+    const ulInner = lmC(62);  // inner upper lip centre
+    const llInner = lmC(66);  // inner lower lip centre
+    const mLeft   = lmC(48);
+    const mRight  = lmC(54);
+    const mCX     = (mLeft.x + mRight.x) / 2;
+    const mWidth  = Math.abs(mRight.x - mLeft.x);
+    const splitY  = (ulInner.y + llInner.y) / 2;
+
+    // Max mouth gap — 10 % of face height (chin → nose bridge) for stability
+    // at any camera distance.  This replaces the old natGap * 4.5 formula
+    // which produced wildly different results depending on how close the user
+    // sat to the camera.
+    const chinY    = lmC(8).y;
+    const noseBrY  = lmC(27).y;
+    const faceH    = Math.abs(chinY - noseBrY);
+    const maxGap   = faceH * 0.12;
+    const gap      = params.mouthOpen * maxGap;
 
     // ── Step 1: draw the full reference image ──────────────────────────────
     ctx.drawImage(image, ir.x, ir.y, ir.w, ir.h);
@@ -205,20 +215,21 @@ export class AvatarRenderer {
         mWidth / 2 + 3, gap / 2 + 3,
         0, 0, Math.PI * 2
       );
-      ctx.fillStyle = '#050505';
+      // Very dark brown instead of pure black — more natural in most lighting
+      ctx.fillStyle = '#0a0605';
       ctx.fill();
       ctx.restore();
 
-      // Thin lip line softens the seam between upper face and jaw
-      ctx.save();
-      ctx.globalAlpha = 0.35;
-      const { sx, sy, sw, sh } = canvasToSrc(
-        faceMinX, splitY - 6, faceColW, 12, cover
-      );
-      if (sw > 0 && sh > 0) {
-        ctx.drawImage(image, sx, sy, sw, sh, faceMinX, splitY - 6, faceColW, 12);
+      // Feathered seam: blend original lip texture back over the split line
+      // Width 16 px (was 12) with a slightly higher alpha for a smoother join.
+      const seam = canvasToSrc(faceMinX, splitY - 8, faceColW, 16, cover);
+      if (seam.sw > 0 && seam.sh > 0) {
+        ctx.save();
+        ctx.globalAlpha = 0.45;
+        ctx.drawImage(image, seam.sx, seam.sy, seam.sw, seam.sh,
+                      faceMinX, splitY - 8, faceColW, 16);
+        ctx.restore();
       }
-      ctx.restore();
     }
 
     // ── Step 3: eye blink overlays ─────────────────────────────────────────
@@ -237,8 +248,13 @@ export class AvatarRenderer {
   }
 
   // ── Eyelid animation ──────────────────────────────────────────────────────
-  // Upper eyelid descends from the top of the eye using skin texture
-  // from the forehead region above, alpha-blended for soft edges.
+  //
+  // Upper eyelid descends progressively from the top of the eye.
+  // The clip region grows downward in lock-step with closedness, revealing
+  // the image shifted down by lidH — which brings forehead/eyelid skin into
+  // the eye area at full opacity.  No alpha blending: the skin texture itself
+  // provides the correct colour.  A tiny dark gradient at the leading edge
+  // softens the lid boundary without making it look translucent.
 
   private drawEyelid(
     ctx: CanvasRenderingContext2D,
@@ -249,38 +265,48 @@ export class AvatarRenderer {
     eyeStart: number,
     closedness: number
   ): void {
-    if (closedness < 0.08) return;
+    if (closedness < 0.05) return;
 
     const lmC    = (i: number) => c2c(lm[i].x, lm[i].y, cover);
     const pts    = [0, 1, 2, 3, 4, 5].map(i => lmC(eyeStart + i));
-    const leftX  = pts[0].x;
-    const rightX = pts[3].x;
+    const leftX  = Math.min(pts[0].x, pts[3].x);
+    const rightX = Math.max(pts[0].x, pts[3].x);
     const eyeW   = Math.abs(rightX - leftX);
     const topY   = Math.min(...pts.map(p => p.y));
     const botY   = Math.max(...pts.map(p => p.y));
     const eyeH   = Math.max(botY - topY, 4);
-    const eyeCX  = (leftX + rightX) / 2;
 
-    const padX    = eyeW * 0.3;
-    const lidH    = closedness * (eyeH + 2);
+    const padX  = eyeW * 0.3;
+    // How far the lid has descended (0 = eye fully open, eyeH+3 = fully closed)
+    const lidH  = closedness * (eyeH + 3);
+    // Clip only the area already covered by the descending lid
+    const clipH = Math.min(lidH, eyeH + 3);
 
-    // Clip to the eye bounding area
+    // Draw skin-texture lid at full opacity, clipped to covered region
     ctx.save();
     ctx.beginPath();
-    ctx.rect(leftX - padX, topY - 2, eyeW + padX * 2, eyeH + 4);
+    ctx.rect(leftX - padX, topY - 2, eyeW + padX * 2, clipH + 2);
     ctx.clip();
-
-    // The eyelid texture: the image region just ABOVE the eye (skin / forehead)
-    // shifted DOWN to cover the eye as the lid closes.
-    // We draw the image shifted down by lidH, which moves the skin above the
-    // eye down over the eye area = natural upper-eyelid appearance.
-    ctx.save();
-    ctx.globalAlpha = Math.min(1, closedness * 1.3);
+    // Shift image down so the skin just above the eye fills the eye area
     ctx.translate(0, lidH);
     ctx.drawImage(image, ir.x, ir.y, ir.w, ir.h);
     ctx.restore();
 
-    ctx.restore();
+    // Soft shadow along the leading edge of the lid (not drawn when fully closed)
+    if (closedness < 0.92 && clipH > 3) {
+      const featherH = Math.min(5, eyeH * 0.25);
+      const featherY = topY + clipH - featherH;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(leftX - padX, featherY, eyeW + padX * 2, featherH);
+      ctx.clip();
+      const grad = ctx.createLinearGradient(0, featherY, 0, featherY + featherH);
+      grad.addColorStop(0, 'rgba(0,0,0,0)');
+      grad.addColorStop(1, 'rgba(0,0,0,0.30)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(leftX - padX, featherY, eyeW + padX * 2, featherH);
+      ctx.restore();
+    }
   }
 
   // ── Eyebrow raise ─────────────────────────────────────────────────────────

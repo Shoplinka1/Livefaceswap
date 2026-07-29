@@ -5,11 +5,14 @@
  *  • Preprocesses video frames through a small (320 px wide) offscreen canvas
  *    with brightness +60 % / contrast +15 % before running detection.
  *    This dramatically improves detection in dark rooms.
- *  • Cascading score thresholds: tries 0.1 then 0.06 per tick.
- *  • Minimum tick gap reduced to 80 ms (was 100 ms).
- *  • All extracted params are scale-invariant ratios, so running detection
- *    on the smaller preprocessed canvas is perfectly valid.
- *  • Smooth eye params faster (alpha × 2.5) for snappy blinks.
+ *  • Three-level cascading score thresholds: 0.10 → 0.06 → 0.04.
+ *    The third level catches very challenging lighting conditions.
+ *  • Minimum tick gap 66 ms (~15 fps detection, smoother than 80 ms).
+ *  • mouthOpen normalised against IOD (inter-ocular distance) — fully
+ *    scale-invariant, works at any camera distance.
+ *  • All other extracted params are ratio-based, so the smaller preprocessed
+ *    canvas produces identical results to the full-resolution frame.
+ *  • Eye alpha ×2.5 for crisp, low-latency blink response.
  */
 import * as faceapi from '@vladmandic/face-api';
 import { type FaceParams, DEFAULT_PARAMS } from './types';
@@ -37,6 +40,9 @@ function ear(pos: faceapi.Point[], s: number): number {
 
 function lerp(a: number, b: number, t: number) { return a + (b - a) * t; }
 function clamp(v: number, lo = 0, hi = 1) { return Math.max(lo, Math.min(hi, v)); }
+
+// ─── Cascade thresholds (tried in order until a face is found) ───────────────
+const THRESHOLDS = [0.10, 0.06, 0.04] as const;
 
 // ─── FaceTracker ─────────────────────────────────────────────────────────────
 
@@ -94,15 +100,13 @@ export class FaceTracker {
           const pW  = src.width;
           const pH  = src.height;
 
-          // Try threshold 0.1 first (fast path), fall back to 0.06
-          let det = await faceapi
-            .detectSingleFace(src, new faceapi.TinyFaceDetectorOptions({ scoreThreshold: 0.1, inputSize: 416 }))
-            .withFaceLandmarks(true);
-
-          if (!det) {
+          // Three-level cascade: fast path first, then progressively lower thresholds
+          let det: faceapi.WithFaceLandmarks<{ detection: faceapi.FaceDetection }> | undefined;
+          for (const t of THRESHOLDS) {
             det = await faceapi
-              .detectSingleFace(src, new faceapi.TinyFaceDetectorOptions({ scoreThreshold: 0.06, inputSize: 416 }))
+              .detectSingleFace(src, new faceapi.TinyFaceDetectorOptions({ scoreThreshold: t, inputSize: 416 }))
               .withFaceLandmarks(true);
+            if (det) break;
           }
 
           if (det) {
@@ -119,7 +123,7 @@ export class FaceTracker {
         this.onParams?.(this._params);
       }
 
-      this.ticker = setTimeout(tick, 80);
+      this.ticker = setTimeout(tick, 66); // ~15 fps detection
     };
 
     tick();
@@ -127,17 +131,16 @@ export class FaceTracker {
 
   stopTracking(): void {
     if (this.ticker) clearTimeout(this.ticker);
-    this.ticker = null;
-    this.busy   = false;
+    this.ticker    = null;
+    this.busy      = false;
     this._params   = { ...DEFAULT_PARAMS };
     this.lastValid = { ...DEFAULT_PARAMS };
   }
 
   // ── Preprocessing ─────────────────────────────────────────────────────────
   // Draw the video frame at half resolution with brightness/contrast boost.
-  // This significantly improves detection in low-light conditions.
-  // Because all extracted params are normalised ratios (not absolute pixels),
-  // running detection on a smaller canvas is equivalent to the full size.
+  // Improves detection in low-light without requiring a brighter environment.
+  // All params are normalised ratios so the smaller canvas is equivalent.
 
   private preprocess(videoEl: HTMLVideoElement): HTMLCanvasElement {
     const vW = videoEl.videoWidth;
@@ -153,7 +156,7 @@ export class FaceTracker {
     }
 
     const ctx = this.ppCtx;
-    // Brightness boost for low-light; contrast for sharper edges
+    // Brightness boost for low-light; contrast sharpens edges for landmark accuracy
     ctx.filter = 'brightness(160%) contrast(115%)';
     ctx.drawImage(videoEl, 0, 0, pW, pH);
     ctx.filter = 'none';
@@ -165,11 +168,10 @@ export class FaceTracker {
 
   private extract(
     det: faceapi.WithFaceLandmarks<{ detection: faceapi.FaceDetection }>,
-    W: number,
-    H: number
+    _W: number,
+    _H: number
   ): FaceParams {
     const pos = det.landmarks.positions;
-    const bb  = det.detection.box;
 
     const lEyeC = avg(pos, 36, 42);
     const rEyeC = avg(pos, 42, 48);
@@ -177,7 +179,7 @@ export class FaceTracker {
     const eyeMX = (lEyeC.x + rEyeC.x) / 2;
     const eyeMY = (lEyeC.y + rEyeC.y) / 2;
 
-    // Roll — eye-line angle (in raw, unmirrored video space)
+    // Roll — eye-line angle (raw, unmirrored video space)
     const roll = Math.atan2(lEyeC.y - rEyeC.y, lEyeC.x - rEyeC.x);
 
     // Yaw — nose offset from eye midpoint, normalised by IOD
@@ -192,13 +194,14 @@ export class FaceTracker {
       : 0;
 
     // Normalised position in frame
-    const tx = clamp((eyeMX / W - 0.5) * 2, -1, 1);
-    const ty = clamp((eyeMY / H - 0.4) * 2, -1, 1);
+    const tx = clamp((eyeMX / _W - 0.5) * 2, -1, 1);
+    const ty = clamp((eyeMY / _H - 0.4) * 2, -1, 1);
 
-    // Mouth open — inner lip gap
+    // Mouth open — inner lip gap normalised against IOD (scale-invariant)
+    // IOD * 0.35 ≈ fully open mouth gap for an average face
     const ulInner   = pos[62];
     const llInner   = pos[66];
-    const mouthOpen = clamp((llInner.y - ulInner.y) / (bb.height * 0.22));
+    const mouthOpen = clamp((llInner.y - ulInner.y) / (iod * 0.35));
 
     // Smile — mouth width vs IOD
     const mLeft = pos[48], mRight = pos[54];
@@ -206,7 +209,8 @@ export class FaceTracker {
     const smile = clamp((mW / iod - 0.65) / 0.5);
 
     // Eye blink (Eye Aspect Ratio)
-    const EAR_OPEN = 0.28, EAR_CLOSED = 0.10;
+    const EAR_OPEN   = 0.28;
+    const EAR_CLOSED = 0.10;
     const lEAR = ear(pos, 36);
     const rEAR = ear(pos, 42);
     const leftEyeOpen  = clamp((lEAR - EAR_CLOSED) / (EAR_OPEN - EAR_CLOSED));
@@ -230,11 +234,11 @@ export class FaceTracker {
   // ── Exponential smoothing ─────────────────────────────────────────────────
 
   private smooth(target: FaceParams): void {
-    const s = this._params;
-    const A = 0.30;       // base alpha
-    const AE = A * 2.5;  // eyes snap faster (blinks need to be crisp)
-    const AM = A * 1.8;  // mouth slightly snappier than head pose
-    const AP = A * 0.55; // position smoothest of all (no drift jitter)
+    const s  = this._params;
+    const A  = 0.30;       // base alpha — head pose
+    const AE = A * 2.5;   // eyes snap faster (blinks need crisp response)
+    const AM = A * 1.8;   // mouth slightly snappier than head pose
+    const AP = A * 0.55;  // position smoothest (no drift jitter)
     this._params = {
       detected:      true,
       roll:          lerp(s.roll,          target.roll,          A),
