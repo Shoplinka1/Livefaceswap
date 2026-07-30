@@ -1,2 +1,2 @@
 - [LiveFaceSwap engine architecture](livefaceswap-engine.md) — avatar-first rendering; camera hidden, uploaded photo is the display; engine in src/engine/.
-- [AvatarRenderer head-pose lesson](avatarrenderer-headpose.md) — never apply roll/yaw/pitch to the canvas transform; always draw reference image upright.
+- [AvatarRenderer architecture lessons](avatarrenderer-headpose.md) — mesh warp is required; overlays on static photo always fail; never apply roll to canvas transform.
